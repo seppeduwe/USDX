@@ -63,7 +63,11 @@ uses
   UPlaylist,
   USong,
   UIni,
-  UCatCovers;
+  UCatCovers,
+    sdl2,
+  SQLite3,
+  SQLiteTable3,
+  UTextEncoding;
 
 type
   TSongFilter = (
@@ -96,6 +100,7 @@ type
   TSongs = class(TThread)
   {$ENDIF}
   private
+
     fNotify, fWatch:     longint;
     fParseSongDirectory: boolean;
     fProcessing:         boolean;
@@ -118,6 +123,22 @@ type
     procedure Sort(Order: TSortingType);
     property  Processing: boolean read fProcessing;
   end;
+
+  TSongsDatabase = class
+    private
+      DB: TSQLiteDatabase;
+      fdatabaseExist: boolean;
+      procedure Open();
+      procedure InitSongsDatabase();
+    public
+      constructor Create();
+      destructor Destroy; override;
+      procedure SaveAllSongs(SongList:TList);
+      procedure RetrieveAllSongs(SongList:TList);
+      property  DatabaseExist: boolean read fdatabaseExist;
+  end;
+
+
 
   TCatSongs = class
     Song:       array of TSong; // array of categories with songs
@@ -145,7 +166,7 @@ type
 var
   Songs:    TSongs;    // all songs
   CatSongs: TCatSongs; // categorized songs
-
+  SongsDatabase: TSongsDatabase;
 const
   IN_ACCESS        = $00000001; //* File was accessed */
   IN_MODIFY        = $00000002; //* File was modified */
@@ -159,6 +180,7 @@ const
   IN_DELETE        = $00000200; //* Subfile was deleted */
   IN_DELETE_SELF   = $00000400; //* Self was deleted */
 
+  SONGSDB_FILENAME: UTF8String = 'songsDB.db';
 
 implementation
 
@@ -180,7 +202,7 @@ begin
   Self.FreeOnTerminate := true;
 
   SongList           := TList.Create();
-
+  SongsDatabase      := TSongsDatabase.Create();
   // until it is fixed, simply load the song-list
   int_LoadSongList();
 end;
@@ -219,33 +241,390 @@ begin
   end;
 {$ENDIF}
 end;
+constructor TSongsDatabase.Create();
+begin
+  inherited;
+  Open();
+  InitSongsDatabase();
+end;
+
+destructor TSongsDatabase.Destroy;
+begin
+  DB.Free;
+  inherited;
+end;
+
+
+procedure TSongsDatabase.Open();
+var
+  Filename: IPath;
+begin
+  Filename := Platform.GetGameUserPath().Append(SONGSDB_FILENAME);
+  fdatabaseExist := Filename.Exists;
+  DB := TSQLiteDatabase.Create(Filename.ToUTF8());
+end;
+
+procedure TSongsDatabase.InitSongsDatabase();
+begin
+  DB.ExecSQL('CREATE TABLE IF NOT EXISTS [Songs] (' +
+'[ID] INTEGER  NOT NULL PRIMARY KEY AUTOINCREMENT, ' +
+'[Path] TEXT NULL, ' +
+'[Folder] TEXT NULL, ' +
+'[FileName] TEXT NULL, ' +
+'[MD5] TEXT NULL, ' +
+'[Cover] TEXT NULL, ' +
+'[Mp3] TEXT NULL, ' +
+'[Background] TEXT NULL, ' +
+'[Video] TEXT NULL, ' +
+'[Genre] TEXT NULL, ' +
+'[Edition] TEXT NULL, ' +
+'[Language] TEXT NULL, ' +
+'[Year] INTEGER NULL, ' +
+'[Title] TEXT NULL, ' +
+'[Artist] TEXT NULL, ' +
+'[TitleNoAccent] TEXT NULL, ' +
+'[ArtistNoAccent] TEXT NULL, ' +
+'[LanguageNoAccent] TEXT NULL, ' +
+'[EditionNoAccent] TEXT NULL, ' +
+'[GenreNoAccent] TEXT NULL, ' +
+'[CreatorNoAccent] TEXT NULL, ' +
+'[Creator] TEXT NULL, ' +
+'[CoverTex] TEXT NULL, ' +
+'[VideoGAP] REAL NULL, ' +
+'[NotesGAP] INTEGER NULL, ' +
+'[Start] REAL NULL, ' +
+'[Finish] INTEGER NULL, ' +
+'[Relative] TEXT NULL, ' +
+'[Resolution] INTEGER NULL, ' +
+// '[BPM] TEXT NULL, ' +
+'[GAP] REAL NULL, ' +
+'[Encoding] TEXT NULL, ' +
+'[PreviewStart] REAL NULL, ' +
+'[HasPreview] TEXT NULL, ' +
+'[CalcMedley] TEXT NULL, ' +
+'[MedleySource] TEXT NULL, ' +
+'[MedleyStartBeat] INTEGER NULL, ' +
+'[MedleyEndBeat] INTEGER NULL, ' +
+'[MedleyFadeIn_time] REAL NULL, ' +
+'[MedleyFadeOut_time] REAL NULL, ' +
+'[isDuet] TEXT NULL, ' +
+// '[DuetNames] TEXT NULL, ' +
+'[hasRap] TEXT NULL, ' +
+//'[CustomTags] TEXT NULL, ' +
+'[Score] TEXT NULL, ' +
+'[Visible] TEXT NULL, ' +
+'[Main] TEXT NULL, ' +
+'[OrderNum] INTEGER NULL, ' +
+'[OrderTyp] INTEGER NULL, ' +
+'[CatNumber] INTEGER NULL, ' +
+'[Base0] INTEGER NULL, ' +
+'[Base1] INTEGER NULL, ' +
+'[Rel0] INTEGER NULL, ' +
+'[Rel1] INTEGER NULL, ' +
+'[Mult] INTEGER NULL, ' +
+'[MultBPM] INTEGER NULL' +
+             ')');
+
+DB.ExecSQL('CREATE TABLE IF NOT EXISTS [Songs_BPM] (' +
+'[ID] INTEGER  NOT NULL PRIMARY KEY AUTOINCREMENT, ' +
+'[SongID] INTEGER  NOT NULL, ' +
+'[BPM] REAL NULL, ' +
+'[StartBeat] REAL NULL' +
+          ')');
+
+ DB.ExecSQL('CREATE TABLE IF NOT EXISTS [Songs_DuetNames] (' +
+'[ID] INTEGER  NOT NULL PRIMARY KEY AUTOINCREMENT, ' +
+'[SongID] INTEGER  NOT NULL, ' +
+'[DuetNames] TEXT NULL ' +
+          ')');
+
+DB.ExecSQL('CREATE TABLE IF NOT EXISTS [Songs_CustomTags] (' +
+'[ID] INTEGER  NOT NULL PRIMARY KEY AUTOINCREMENT, ' +
+'[SongID] INTEGER  NOT NULL, ' +
+'[Tag] TEXT NULL, ' +
+'[Content] TEXT NULL' +
+          ')');
+end;
+
+procedure TSongsDatabase.SaveAllSongs(SongList:TList);
+var
+    CurSong:     TSong;
+    ID:        integer;
+    SongIndex: integer;
+    CurBPM : USong.TBPM;
+    CurDuetName: UTF8String;
+    CurCustomTag: USong.TCustomHeaderTag   ;
+begin
+try
+    // Note: use a transaction to speed-up file-writing.
+    // Without data written by the first INSERT might be moved at the second INSERT.
+DB.BeginTransaction();
+for SongIndex := 0 to SongList.Count - 1 do
+ begin
+ CurSong := TSong(SongList[SongIndex]);
+ DB.ExecSQL(
+         'INSERT INTO [Songs] ' +
+         '(Path, Folder, FileName, MD5, Cover, Mp3, Background, Video, Genre, Edition, Language, Year, Title, Artist, TitleNoAccent, ArtistNoAccent, LanguageNoAccent, EditionNoAccent, GenreNoAccent, CreatorNoAccent, Creator, CoverTex, VideoGAP, NotesGAP, Start, Finish, Relative, Resolution, GAP, Encoding, PreviewStart, HasPreview, CalcMedley, MedleySource, MedleyStartBeat, MedleyEndBeat, MedleyFadeIn_time, MedleyFadeOut_time, isDuet, hasRap, Score, Visible, Main, OrderNum, OrderTyp, CatNumber, Base0, Base1, Rel0, Rel1, Mult, MultBPM) VALUES ' +
+         '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);',
+         [CurSong.Path.ToNative,
+         CurSong.Folder,
+         CurSong.FileName.ToNative,
+         CurSong.MD5,
+         CurSong.Cover.ToNative,
+         CurSong.Mp3.ToNative,
+         CurSong.Background.ToNative,
+         CurSong.Video.ToNative,
+         CurSong.Genre,
+         CurSong.Edition,
+         CurSong.Language,
+         CurSong.Year,
+         CurSong.Title,
+         CurSong.Artist,
+         CurSong.TitleNoAccent,
+         CurSong.ArtistNoAccent,
+         CurSong.LanguageNoAccent,
+         CurSong.EditionNoAccent,
+         CurSong.GenreNoAccent,
+         CurSong.CreatorNoAccent,
+         CurSong.Creator,
+         '', // CoverTex Not implemented
+         CurSong.VideoGAP,
+         CurSong.NotesGAP,
+         CurSong.Start,
+         CurSong.Finish,
+         CurSong.Relative,
+         CurSong.Resolution,
+         // '', // Other table BPM
+         CurSong.GAP,
+         CurSong.Encoding,
+         CurSong.PreviewStart,
+         CurSong.HasPreview,
+         CurSong.CalcMedley,
+         CurSong.Medley.Source,
+         CurSong.Medley.StartBeat,
+         CurSong.Medley.EndBeat,
+         CurSong.Medley.FadeIn_time,
+         CurSong.Medley.FadeOut_time,
+         CurSong.isDuet,
+         // '', // Other table DuetNames
+         CurSong.hasRap,
+         // '', // Other Table CustomTags Not implemented
+         '', // Score Not implemented
+         CurSong.Visible,
+         CurSong.Main,
+         CurSong.OrderNum,
+         CurSong.OrderTyp,
+         CurSong.CatNumber,
+         CurSong.Base[0], // Base
+         CurSong.Base[1],
+         CurSong.Rel[0], // Rel
+         CurSong.Rel[1],
+         CurSong.Mult,
+         CurSong.MultBPM]);
+
+    ID := DB.GetLastInsertRowID();
+
+    for CurBPM in CurSong.BPM do
+     begin
+         DB.ExecSQL(
+         'INSERT INTO [Songs_BPM] ' +
+         '([SongID],[BPM], [StartBeat]) VALUES ' +
+         '(?,?,?);',
+         [ID,CurBPM.BPM,CurBPM.StartBeat]);
+     end;
+
+    for CurDuetName in CurSong.DuetNames do
+     begin
+         DB.ExecSQL(
+         'INSERT INTO [Songs_DuetNames] ' +
+         '([SongID],[DuetNames]) VALUES ' +
+         '(?,?);',
+         [ID,CurDuetName]);
+     end;
+
+    for CurCustomTag in CurSong.CustomTags do
+     begin
+         DB.ExecSQL(
+         'INSERT INTO [Songs_CustomTags] ' +
+         '([SongID],[Tag],[Content]) VALUES ' +
+         '(?,?);',
+         [ID,CurCustomTag.Tag,CurCustomTag.Content]);
+     end;
+  end;
+  except on E: Exception do
+    Log.LogError(E.Message, 'TSongsDatabase.AddSongs');
+  end;
+
+  DB.Commit();
+
+end;
+
+procedure TSongsDatabase.RetrieveAllSongs(SongList:TList);
+ var
+       BPMIndex: integer;
+       DuetNamesIndex: integer;
+       CurSong: TSong;
+       TableData_Songs: TSQLiteUniTable;
+       TableData_Songs_BPM: TSQLiteUniTable;
+       TableData_Songs_DuetNames: TSQLiteUniTable;
+       TableData_Songs_CustomTags: TSQLiteUniTable;
+       Medley: TMedley;
+ begin
+   if not Assigned(DB) then
+    Exit;
+
+   TableData_Songs := nil;
+   TableData_Songs_BPM := nil;
+   TableData_Songs_DuetNames := nil;
+   TableData_Songs_CustomTags := nil;
+
+   try
+
+   TableData_Songs := DB.GetUniTable('SELECT * FROM [Songs]');
+
+   while (not TableData_Songs.EOF) do
+    begin
+      CurSong := TSong.Create();
+      CurSong.Path  := UPath.Path(TableData_Songs.Fields[1]);
+      CurSong.Folder := TableData_Songs.Fields[2] ;
+      CurSong.FileName := UPath.Path(TableData_Songs.Fields[3]);
+      CurSong.MD5 := TableData_Songs.Fields[4] ;
+      CurSong.Cover := UPath.Path(TableData_Songs.Fields[5]);
+      CurSong.Mp3 := UPath.Path(TableData_Songs.Fields[6]);
+      CurSong.Background := UPath.Path(TableData_Songs.Fields[7]);
+      CurSong.Video := UPath.Path(TableData_Songs.Fields[8]);
+      CurSong.Genre := TableData_Songs.Fields[9] ;
+      CurSong.Edition := TableData_Songs.Fields[10];
+      CurSong.Language := TableData_Songs.Fields[11];
+      CurSong.Year := TableData_Songs.FieldAsInteger(12);
+      CurSong.Title := TableData_Songs.Fields[13];
+      CurSong.Artist := TableData_Songs.Fields[14];
+      CurSong.TitleNoAccent := TableData_Songs.Fields[15];
+      CurSong.ArtistNoAccent := TableData_Songs.Fields[16];
+      CurSong.LanguageNoAccent := TableData_Songs.Fields[17];
+      CurSong.EditionNoAccent := TableData_Songs.Fields[18];
+      CurSong.GenreNoAccent := TableData_Songs.Fields[19];
+      CurSong.CreatorNoAccent := TableData_Songs.Fields[20];
+      CurSong.Creator := TableData_Songs.Fields[21];
+      // CoverTex Not implemente
+      CurSong.VideoGAP := TableData_Songs.FieldAsDouble(23);
+      CurSong.NotesGAP := TableData_Songs.FieldAsInteger(24) ;
+      CurSong.Start := TableData_Songs.FieldAsDouble(25);
+      CurSong.Finish := TableData_Songs.FieldAsInteger(26) ;
+      CurSong.Relative := StrToBool(TableData_Songs.Fields[27])  ;
+      CurSong.Resolution := TableData_Songs.FieldAsInteger(28);
+      CurSong.GAP := TableData_Songs.FieldAsDouble(29) ;
+      CurSong.Encoding := UTextEncoding.TEncoding(TableData_Songs.FieldAsInteger(30));
+      CurSong.PreviewStart := TableData_Songs.FieldAsDouble(31);
+      CurSong.HasPreview := StrToBool(TableData_Songs.Fields[32]) ;
+      CurSong.CalcMedley := StrToBool(TableData_Songs.Fields[33]) ;
+      CurSong.Medley.Source := TMedleySource(TableData_Songs.FieldAsInteger(34));
+      CurSong.Medley.StartBeat := TableData_Songs.FieldAsInteger(35);
+      CurSong.Medley.EndBeat := TableData_Songs.FieldAsInteger(36);
+      CurSong.Medley.FadeIn_time := TableData_Songs.FieldAsDouble(37);
+      CurSong.Medley.FadeOut_time := TableData_Songs.FieldAsDouble(38);
+      CurSong.isDuet := StrToBool(TableData_Songs.Fields[39]) ;
+      CurSong.hasRap := StrToBool(TableData_Songs.Fields[40]) ;
+      // Score Not implemented, use different DB
+      CurSong.Visible := StrToBool(TableData_Songs.Fields[42]);
+      CurSong.Main := StrToBool(TableData_Songs.Fields[43]);
+      CurSong.OrderNum := TableData_Songs.FieldAsInteger(44) ;
+      CurSong.OrderTyp := TableData_Songs.FieldAsInteger(45);
+      CurSong.CatNumber := TableData_Songs.FieldAsInteger(46) ;
+      CurSong.Base[0] := TableData_Songs.FieldAsInteger(47);
+      CurSong.Base[1] := TableData_Songs.FieldAsInteger(48);
+      CurSong.Rel[0] := TableData_Songs.FieldAsInteger(49) ;
+      CurSong.Rel[1] := TableData_Songs.FieldAsInteger(50) ;
+      CurSong.Mult := TableData_Songs.FieldAsInteger(51) ;
+      CurSong.MultBPM := TableData_Songs.FieldAsInteger(52) ;
+
+     TableData_Songs_BPM := DB.GetUniTable(
+      'SELECT * FROM [Songs_BPM] ' +
+      'WHERE [SongID] = ? ',
+      [TableData_Songs.FieldAsInteger(0)]);
+
+     TableData_Songs_DuetNames := DB.GetUniTable(
+      'SELECT * FROM [Songs_DuetNames] ' +
+      'WHERE [SongID] = ? ',
+      [TableData_Songs.FieldAsInteger(0)]);
+
+     TableData_Songs_CustomTags := DB.GetUniTable(
+      'SELECT * FROM [Songs_CustomTags] ' +
+      'WHERE [SongID] = ? ',
+      [TableData_Songs.FieldAsInteger(0)]);
+
+     while (not TableData_Songs_BPM.EOF) do
+      begin
+           SetLength(CurSong.BPM,TableData_Songs_BPM.Row);
+           CurSong.BPM[TableData_Songs_BPM.Row-1].BPM :=TableData_Songs.FieldAsDouble(2);
+           CurSong.BPM[TableData_Songs_BPM.Row-1].StartBeat := TableData_Songs.FieldAsDouble(3);
+           TableData_Songs_BPM.Next;
+      end;
+     while (not TableData_Songs_DuetNames.EOF) do
+      begin
+           SetLength(CurSong.DuetNames,TableData_Songs_DuetNames.Row);
+           CurSong.DuetNames[TableData_Songs_DuetNames.Row-1] := TableData_Songs_DuetNames.Fields[2];
+           TableData_Songs_DuetNames.Next;
+      end;
+     while (not TableData_Songs_CustomTags.EOF) do
+      begin
+           SetLength(CurSong.CustomTags,TableData_Songs_CustomTags.Row);
+           CurSong.CustomTags[TableData_Songs_CustomTags.Row-1].Tag := TableData_Songs_CustomTags.Fields[2];
+           CurSong.CustomTags[TableData_Songs_CustomTags.Row-1].Content := TableData_Songs_CustomTags.Fields[3];
+           TableData_Songs_CustomTags.Next;
+      end;
+
+     SongList.Add(CurSong);
+     TableData_Songs.Next;
+    end; // while
+    except on E: Exception do
+           Log.LogError(E.Message, 'TSongsDatabase.ReadSongs');
+    end;
+    TableData_Songs.Free;
+    TableData_Songs_BPM.Free;
+    TableData_Songs_DuetNames.Free;
+    TableData_Songs_CustomTags.Free;
+end;
 
 procedure TSongs.int_LoadSongList;
 var
   I: integer;
+  Filename: IPath;
+  SongIndex:   integer;
+
 begin
   try
     fProcessing := true;
-
     Log.LogStatus('Searching For Songs', 'SongList');
-
     // browse directories
-    for I := 0 to SongPaths.Count-1 do
-      BrowseDir(SongPaths[I] as IPath);
-
+    if(SongsDatabase.DatabaseExist) then
+        SongsDatabase.RetrieveAllSongs(SongList)
+    else
+    begin
+     for I := 0 to SongPaths.Count-1 do
+        BrowseDir(SongPaths[I] as IPath);
+     SongsDatabase.SaveAllSongs(SongList);
+    end;
+    Log.LogStatus('Search Songs Complete', 'SongList');
     if assigned(CatSongs) then
+    begin
       CatSongs.Refresh;
-
+      Log.LogStatus('Search CatSongs Complete', 'SongList');
+    end;
     if assigned(CatCovers) then
+    begin
       CatCovers.Load;
+      Log.LogStatus('Search CatCovers Complete', 'SongList');
+    end;
 
-    //if assigned(Covers) then
-    //  Covers.Load;
+    if assigned(Covers) then
+      //Covers.Load;
 
     if assigned(ScreenSong)  then
     begin
       ScreenSong.GenerateThumbnails();
       ScreenSong.OnShow; // refresh ScreenSong
+      Log.LogStatus('Search ScreenSong Complete', 'SongList');
     end;
 
   finally
